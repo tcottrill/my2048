@@ -333,6 +333,11 @@
             const SWIPE_MIN_DISTANCE = 28;
             const BEST_KEY = "html2048.bestScore.v2";
 
+            // iPhones often report devicePixelRatio 3. Drawing a 500 x 500 CSS
+            // canvas at 3x creates a 1500 x 1500 backing store every animation
+            // frame. 2x is still sharp for this game and cuts the redraw cost.
+            const MAX_RENDER_DPR = 2;
+
             const TILE_COLORS = {
                 2:    { bg: "#eee4da", text: "#776e65" },
                 4:    { bg: "#ede0c8", text: "#776e65" },
@@ -374,6 +379,13 @@
             let moveAnimation = null;
             let popAnimations = new Map();
             let boardPixels = 500;
+            let boardDpr = 1;
+            let boardLayout = { gap: 15, tile: 106.25, radius: 6 };
+            let lastCanvasCssSize = 0;
+            let lastCanvasDpr = 0;
+            let rafHandle = 0;
+            let resizeTimer = 0;
+            let bestSaveTimer = 0;
             let lastRenderTime = 0;
             let activePointerId = null;
             let dragStartX = 0;
@@ -394,6 +406,27 @@
 
             function saveBestScore() {
                 localStorage.setItem(BEST_KEY, String(bestScore));
+            }
+
+            function scheduleBestScoreSave() {
+                if (bestSaveTimer) {
+                    return;
+                }
+
+                // localStorage is synchronous. Deferring prevents a small storage
+                // write from landing in the middle of a swipe animation.
+                bestSaveTimer = window.setTimeout(() => {
+                    bestSaveTimer = 0;
+                    saveBestScore();
+                }, 250);
+            }
+
+            function flushBestScoreSave() {
+                if (bestSaveTimer) {
+                    window.clearTimeout(bestSaveTimer);
+                    bestSaveTimer = 0;
+                }
+                saveBestScore();
             }
 
             function createTile(value, row, col) {
@@ -527,7 +560,7 @@
                 if (score > bestScore) {
                     bestScore = score;
                     bestScoreEl.textContent = String(bestScore);
-                    saveBestScore();
+                    scheduleBestScoreSave();
                 }
 
                 if (addition > 0) {
@@ -542,26 +575,53 @@
             function setupCanvas() {
                 const rect = gameWrap.getBoundingClientRect();
                 const cssSize = Math.max(260, Math.floor(rect.width));
-                const dpr = Math.max(1, window.devicePixelRatio || 1);
+                const dpr = Math.min(MAX_RENDER_DPR, Math.max(1, window.devicePixelRatio || 1));
 
                 boardPixels = cssSize;
-                canvas.width = Math.floor(cssSize * dpr);
-                canvas.height = Math.floor(cssSize * dpr);
-                canvas.style.width = `${cssSize}px`;
-                canvas.style.height = `${cssSize}px`;
+                boardDpr = dpr;
+                boardLayout = buildBoardLayout(cssSize);
+
+                const backingWidth = Math.floor(cssSize * dpr);
+                const backingHeight = Math.floor(cssSize * dpr);
+                const sizeChanged = cssSize !== lastCanvasCssSize || dpr !== lastCanvasDpr;
+
+                if (sizeChanged || canvas.width !== backingWidth || canvas.height !== backingHeight) {
+                    canvas.width = backingWidth;
+                    canvas.height = backingHeight;
+                    canvas.style.width = `${cssSize}px`;
+                    canvas.style.height = `${cssSize}px`;
+                    lastCanvasCssSize = cssSize;
+                    lastCanvasDpr = dpr;
+                }
+
                 ctx.setTransform(dpr, 0, 0, dpr, 0, 0);
                 requestDraw();
             }
 
-            function boardMetrics() {
-                const gap = Math.max(10, Math.round(boardPixels * 0.03));
-                const tile = (boardPixels - gap * (GRID_SIZE + 1)) / GRID_SIZE;
+            function scheduleCanvasSetup(delay = 120) {
+                if (resizeTimer) {
+                    window.clearTimeout(resizeTimer);
+                }
+
+                resizeTimer = window.setTimeout(() => {
+                    resizeTimer = 0;
+                    setupCanvas();
+                }, delay);
+            }
+
+            function buildBoardLayout(size) {
+                const gap = Math.max(10, Math.round(size * 0.03));
+                const tile = (size - gap * (GRID_SIZE + 1)) / GRID_SIZE;
                 const radius = Math.max(4, Math.round(tile * 0.055));
                 return { gap, tile, radius };
             }
 
+            function boardMetrics() {
+                return boardLayout;
+            }
+
             function tilePosition(row, col) {
-                const m = boardMetrics();
+                const m = boardLayout;
                 return {
                     x: m.gap + col * (m.tile + m.gap),
                     y: m.gap + row * (m.tile + m.gap),
@@ -693,12 +753,19 @@
                 }
 
                 if (moveAnimation || popAnimations.size > 0) {
-                    requestAnimationFrame(draw);
+                    requestDraw();
                 }
             }
 
             function requestDraw() {
-                requestAnimationFrame(draw);
+                if (rafHandle) {
+                    return;
+                }
+
+                rafHandle = requestAnimationFrame((now) => {
+                    rafHandle = 0;
+                    draw(now);
+                });
             }
 
             function clamp(v, min, max) {
@@ -990,10 +1057,15 @@
             newGameButton.addEventListener("click", startGame);
             startButton.addEventListener("click", startGame);
 
-            window.addEventListener("resize", setupCanvas);
+            window.addEventListener("resize", () => {
+                scheduleCanvasSetup(120);
+            }, { passive: true });
+
             window.addEventListener("orientationchange", () => {
-                setTimeout(setupCanvas, 200);
-            });
+                scheduleCanvasSetup(260);
+            }, { passive: true });
+
+            window.addEventListener("pagehide", flushBestScoreSave);
 
             setupCanvas();
             resetGame(false);
